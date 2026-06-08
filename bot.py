@@ -2,7 +2,8 @@ import os
 import json
 import sqlite3
 import logging
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 from company_knowledge import COMPANY_INFO
@@ -16,10 +17,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-genai.configure(api_key=GEMINI_API_KEY)
+if not TELEGRAM_TOKEN:
+    raise ValueError("TELEGRAM_TOKEN не задан!")
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY не задан!")
+
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 MAX_HISTORY = 10
 DB_PATH = "conversations.db"
@@ -95,18 +101,20 @@ def clear_history(chat_id: int) -> None:
         conn.commit()
 
 
-def build_gemini_history(history: list) -> list:
-    """Конвертирует историю в формат Gemini (role: user/model)."""
-    gemini_history = []
-    for msg in history:
+def build_gemini_contents(history: list, user_text: str) -> list:
+    """Собирает историю + новое сообщение в формат Gemini."""
+    contents = []
+    recent = history[-MAX_HISTORY * 2:] if len(history) > MAX_HISTORY * 2 else history
+    for msg in recent:
         role = "model" if msg["role"] == "assistant" else "user"
-        gemini_history.append({"role": role, "parts": [msg["content"]]})
-    return gemini_history
+        contents.append(types.Content(role=role, parts=[types.Part(text=msg["content"])]))
+    contents.append(types.Content(role="user", parts=[types.Part(text=user_text)]))
+    return contents
 
 
 def clean_response(text: str) -> str:
     """Убирает markdown-символы из ответа модели."""
-    for sym in ["**", "__", "##", "# ", "### ", "* ", "- "]:
+    for sym in ["**", "__", "##", "# ", "### "]:
         text = text.replace(sym, "")
     return text.strip()
 
@@ -141,18 +149,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     try:
-        model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
-            system_instruction=SYSTEM_PROMPT,
+        contents = build_gemini_contents(history, user_text)
+
+        response = gemini_client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                max_output_tokens=1000,
+                temperature=0.3,
+            ),
         )
 
-        recent_history = history[-MAX_HISTORY * 2:] if len(history) > MAX_HISTORY * 2 else history
-        gemini_history = build_gemini_history(recent_history)
-
-        chat = model.start_chat(history=gemini_history)
-        response = chat.send_message(user_text)
         assistant_reply = clean_response(response.text)
-
 
         history.append({"role": "user", "content": user_text})
         history.append({"role": "assistant", "content": assistant_reply})
